@@ -1,158 +1,161 @@
-#define BLYNK_TEMPLATE_ID "TMPL3w-o5HZik"
-#define BLYNK_TEMPLATE_NAME "HYDRO HACKERS"
+#define BLYNK_TEMPLATE_ID "TMPL3H6aR4481"
+#define BLYNK_TEMPLATE_NAME "HYDROGUARD"
 
-#include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <BlynkSimpleEsp32.h>
 
-// WiFi credentials
+// WiFi Credentials
 const char* ssid = "AYANOKOJI";
 const char* password = "KARUIZAWA";
 
-// MQTT broker
-const char* mqtt_server = "192.168.1.22";
-const int mqtt_port = 1883;
+// HiveMQ MQTT Broker
+const char* mqtt_server = "797b39718192449bbfe32bbe03652c57.s1.eu.hivemq.cloud";
+const int mqtt_port = 8883;
+const char* mqtt_user = "SIDDMQTT";
+const char* mqtt_pass = "SIDDmqtt@123";
 
-WiFiClient espClient;
+WiFiClientSecure espClient;
 PubSubClient mqttClient(espClient);
 
-// Shared Blynk auth token for the project
-char auth[] = "v-UDDmVfIPMLSaLBs9R3q7SjW9_h7a9X";
+// Blynk Auth Token
+char auth[] = "TBq35TGzti1SuxhqWHZ3HbG2XeNKlSAv";
 
-// Unique identifier for Node 1
-const char* nodeID = "node1";
+// Node ID
+const char* nodeID = "node-1";
 
-// MQTT topics: publish sensor data and subscribe to commands
+// MQTT Topics
 String mqtt_topic_pub = String("esp32/") + nodeID + "/sensor";
 String mqtt_topic_sub = String("esp32/") + nodeID + "/command";
 
 // Sensor Pins
-#define FLOW_SENSOR_1 14
-#define FLOW_SENSOR_2 27
-#define PRESSURE_SENSOR 34 // ADC pin for pressure sensor
+#define FLOW_SENSOR 14
+#define PRESSURE_SENSOR 27
+#define TAMPER_SENSOR 25  // Tamper Detection GPIO Pin
 
-volatile int flow1_pulse_count = 0;
-volatile int flow2_pulse_count = 0;
-float calibrationFactor = 4.5; // Adjust based on your sensor's datasheet
+// LED Pins
+#define POWER_LED 2
+#define WIFI_LED 4
+#define LEAK_LED 5
 
-// Thresholds
-const float FLOW_THRESHOLD = 20.0; // L/min
-const float PRESSURE_THRESHOLD = 8.0; // bar
+// Flow Sensor Variables
+volatile int flow_pulse_count = 0;
 
+// Alarm Logic Variables
 bool alarmActive = false;
-bool alarmEnabled = true; // Controlled via Blynk switch
+unsigned long alarmStartTime = 0;
+unsigned long leakStartTime = 0;  // Timer for 10s delay
+const unsigned long ALARM_DURATION = 3600000;  // 1 hour
+const unsigned long LEAK_DETECTION_TIME = 10000;  // 10 seconds
 
-// Interrupt Service Routine (ISR) for flow sensors
-void IRAM_ATTR pulseCounter1() {
-  flow1_pulse_count++;
-}
-void IRAM_ATTR pulseCounter2() {
-  flow2_pulse_count++;
-}
+// Interrupt Service Routine (ISR)
+void IRAM_ATTR pulseCounter() { flow_pulse_count++; }
 
-void setup_wifi() {
-  Serial.println("Connecting to WiFi...");
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\n✅ WiFi connected");
-}
+void setup() {
+    Serial.begin(115200);
+    pinMode(POWER_LED, OUTPUT);
+    pinMode(WIFI_LED, OUTPUT);
+    pinMode(LEAK_LED, OUTPUT);
+    digitalWrite(POWER_LED, HIGH);  // Indicate power ON
+    digitalWrite(WIFI_LED, LOW);
+    digitalWrite(LEAK_LED, LOW);
 
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  String message;
-  for (unsigned int i = 0; i < length; i++) {
-    message += (char)payload[i];
-  }
-  Serial.println("📩 MQTT Received on " + String(topic) + ": " + message);
+    WiFi.begin(ssid, password);
+    Serial.print("Connecting to WiFi");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\n✅ WiFi Connected!");
+
+    // MQTT Setup
+    espClient.setInsecure();
+    mqttClient.setServer(mqtt_server, mqtt_port);
+    reconnectMQTT();
+
+    // Start Blynk
+    Blynk.begin(auth, ssid, password);
+
+    // Setup Sensors
+    pinMode(FLOW_SENSOR, INPUT);
+    pinMode(PRESSURE_SENSOR, INPUT);
+    pinMode(TAMPER_SENSOR, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR), pulseCounter, RISING);
 }
 
 void reconnectMQTT() {
-  while (!mqttClient.connected()) {
-    Serial.print("🔄 Attempting MQTT connection...");
-    if (mqttClient.connect(nodeID)) {
-      Serial.println("✅ Connected!");
-      mqttClient.subscribe(mqtt_topic_sub.c_str());
-    } else {
-      Serial.print("❌ Failed, rc=");
-      Serial.print(mqttClient.state());
-      Serial.println(" Retrying in 5 seconds...");
-      delay(5000);
+    while (!mqttClient.connected()) {
+        Serial.print("🔄 Connecting to HiveMQ...");
+        if (mqttClient.connect(nodeID, mqtt_user, mqtt_pass)) {
+            Serial.println("✅ MQTT Connected!");
+            digitalWrite(WIFI_LED, HIGH);
+            mqttClient.subscribe(mqtt_topic_sub.c_str());
+        } else {
+            Serial.println("❌ Failed, retrying in 5s...");
+            digitalWrite(WIFI_LED, LOW);
+            delay(5000);
+        }
     }
-  }
 }
 
-BLYNK_WRITE(V7) { // Alarm enable/disable switch
-  alarmEnabled = param.asInt();
-  if (!alarmEnabled) {
-    alarmActive = false;
-    Blynk.virtualWrite(V8, 0); // Turn off alarm indicator
-    Serial.println("🚨 Alarm disabled");
-  } else {
-    Serial.println("🚨 Alarm enabled");
-  }
-}
-
-void setup() {
-  Serial.begin(115200);
-  setup_wifi();
-
-  Blynk.begin(auth, ssid, password);
-  mqttClient.setServer(mqtt_server, mqtt_port);
-  mqttClient.setCallback(mqttCallback);
-
-  pinMode(FLOW_SENSOR_1, INPUT);
-  pinMode(FLOW_SENSOR_2, INPUT);
-  attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_1), pulseCounter1, RISING);
-  attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_2), pulseCounter2, RISING);
+void checkWiFiStatus() {
+    if (WiFi.status() == WL_CONNECTED) {
+        digitalWrite(WIFI_LED, HIGH);
+    } else {
+        digitalWrite(WIFI_LED, LOW);
+        digitalWrite(LEAK_LED, LOW);
+        Serial.println("❌ WiFi Disconnected!");
+        WiFi.reconnect();
+    }
 }
 
 void loop() {
-  Blynk.run();
+    Blynk.run();
+    if (!mqttClient.connected()) reconnectMQTT();
+    mqttClient.loop();
+    checkWiFiStatus();
 
-  if (!mqttClient.connected()) {
-    reconnectMQTT();
-  }
-  mqttClient.loop();
+    static unsigned long lastPublish = 0;
+    unsigned long now = millis();
 
-  // Publish sensor data every 10 seconds
-  static unsigned long lastPublish = 0;
-  if (millis() - lastPublish > 10000) {
-    float flowRate1 = (flow1_pulse_count / 7.5); // Convert to L/min
-    float flowRate2 = (flow2_pulse_count / 7.5);
-    flow1_pulse_count = 0;
-    flow2_pulse_count = 0;
+    if (now - lastPublish >= 1000) {
+        float flowRate = (flow_pulse_count / 7.5);
+        flow_pulse_count = 0;
 
-    int rawPressure = analogRead(PRESSURE_SENSOR);
-    float voltage = rawPressure * (3.3 / 4095.0); // Convert ADC value to voltage (ESP32 12-bit ADC)
-    float pressure = (voltage - 0.5) * (1.2 / 4.0) * 10; // Convert voltage to pressure (MPa to bar)
+        int rawPressure = analogRead(PRESSURE_SENSOR);
+        float voltage = rawPressure * (3.3 / 4095.0);
+        float pressureMPa = ((voltage - 0.5) / (4.0)) * 1.2;
+        float pressureBar = pressureMPa * 10;
 
-    char payload[100];
-    sprintf(payload, "Flow1: %.2f L/min, Flow2: %.2f L/min, Pressure: %.2f bar", flowRate1, flowRate2, pressure);
-    mqttClient.publish(mqtt_topic_pub.c_str(), payload);
+        // Leak detection logic with 10s delay
+        if (flowRate > 3) {
+            if (leakStartTime == 0) {
+                leakStartTime = now;  // Start timer if flow rate > 3
+            } else if (now - leakStartTime >= LEAK_DETECTION_TIME) {
+                if (!alarmActive) {
+                    alarmActive = true;
+                    alarmStartTime = now;
+                    digitalWrite(LEAK_LED, HIGH);
+                    mqttClient.publish("esp32/alarm", "🚨 Leak Detected!");
+                    Serial.println("🚨 Leak Detected!");
+                }
+            }
+        } else {
+            leakStartTime = 0;  // Reset timer if flow rate drops below 3
+        }
 
-    Serial.println("📤 Published sensor values: " + String(payload));
+        // Reset alarm after 1 hour
+        if (alarmActive && (now - alarmStartTime >= ALARM_DURATION)) {
+            alarmActive = false;
+            digitalWrite(LEAK_LED, LOW);
+            Serial.println("✅ Leak Alarm Reset");
+        }
 
-    // Send values to Blynk
-    Blynk.virtualWrite(V1, flowRate1);
-    Blynk.virtualWrite(V2, flowRate2);
-    Blynk.virtualWrite(V3, pressure);
+        char payload[100];
+        sprintf(payload, "Flow: %.2f L/min, Pressure: %.2f bar", flowRate, pressureBar);
+        mqttClient.publish(mqtt_topic_pub.c_str(), payload);
+        Serial.println("📤 Published: " + String(payload));
 
-    // Check thresholds and trigger alarm
-    if (alarmEnabled && (flowRate1 > FLOW_THRESHOLD || flowRate2 > FLOW_THRESHOLD || pressure > PRESSURE_THRESHOLD)) {
-      if (!alarmActive) {
-        alarmActive = true;
-        Blynk.virtualWrite(V8, 1); // Turn on alarm indicator
-        Blynk.logEvent("alarm_triggered", "🚨 Threshold exceeded on Node 1!");
-        Serial.println("🚨 Alarm triggered!");
-      }
-    } else if (alarmActive) {
-      alarmActive = false;
-      Blynk.virtualWrite(V8, 0); // Turn off alarm indicator
-      Serial.println("✅ Alarm cleared");
+        lastPublish = now;
     }
-
-    lastPublish = millis();
-  }
 }
