@@ -30,7 +30,7 @@ String mqtt_topic_sub = String("esp32/") + nodeID + "/command";
 
 // Sensor Pins
 #define FLOW_SENSOR 14
-#define PRESSURE_SENSOR 27
+#define PRESSURE_SENSOR 34
 #define TAMPER_SENSOR 25  // Tamper Detection GPIO Pin
 
 // LED Pins
