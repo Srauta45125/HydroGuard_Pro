@@ -56,7 +56,7 @@ void setup() {
     pinMode(POWER_LED, OUTPUT);
     pinMode(WIFI_LED, OUTPUT);
     pinMode(LEAK_LED, OUTPUT);
-    digitalWrite(POWER_LED, HIGH);  // Indicate power ON
+    digitalWrite(POWER_LED, HIGH);  // Keep power LED always ON
     digitalWrite(WIFI_LED, LOW);
     digitalWrite(LEAK_LED, LOW);
 
