@@ -4,6 +4,7 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <BlynkSimpleEsp32.h>
+#include <ArduinoJson.h>
 
 // WiFi Credentials
 const char* ssid = "AYANOKOJI";
@@ -21,17 +22,19 @@ PubSubClient mqttClient(espClient);
 // Blynk Auth Token
 char auth[] = "TBq35TGzti1SuxhqWHZ3HbG2XeNKlSAv";
 
-// Node ID
+// Node ID - Change to "node-1" for the other ESP32
 const char* nodeID = "node-2";
+const char* otherNodeID = "node-1";
 
 // MQTT Topics
-String mqtt_topic_pub = String("esp32/") + nodeID + "/sensor";
-String mqtt_topic_sub = String("esp32/") + nodeID + "/command";
+String mqtt_topic_pub = "esp32/" + String(nodeID) + "/sensor";
+String mqtt_topic_flow_pub = "esp32/" + String(nodeID) + "/flow";
+String mqtt_topic_flow_sub = "esp32/" + String(otherNodeID) + "/flow";
 
 // Sensor Pins
 #define FLOW_SENSOR 32
 #define PRESSURE_SENSOR 35
-#define TAMPER_SENSOR 25  // Tamper Detection GPIO Pin
+#define TAMPER_SENSOR 25  
 
 // LED Pins
 #define POWER_LED 2
@@ -40,23 +43,41 @@ String mqtt_topic_sub = String("esp32/") + nodeID + "/command";
 
 // Flow Sensor Variables
 volatile int flow_pulse_count = 0;
+float otherNodeFlowRate = 0.0;  // Flow rate from the other node
 
 // Alarm Logic Variables
 bool alarmActive = false;
 unsigned long alarmStartTime = 0;
-unsigned long leakStartTime = 0;  // Timer for 10s delay
+unsigned long leakStartTime = 0;
 const unsigned long ALARM_DURATION = 3600000;  // 1 hour
 const unsigned long LEAK_DETECTION_TIME = 10000;  // 10 seconds
 
 // Interrupt Service Routine (ISR)
 void IRAM_ATTR pulseCounter() { flow_pulse_count++; }
 
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    payload[length] = '\0';  // Null-terminate JSON payload
+    String message = String((char*)payload);
+    
+    // Parse JSON
+    StaticJsonDocument<100> doc;
+    deserializeJson(doc, message);
+    
+    if (String(topic) == mqtt_topic_flow_sub) {
+        otherNodeFlowRate = doc["flow"];
+        Serial.print("📩 Received flow data from ");
+        Serial.print(otherNodeID);
+        Serial.print(": ");
+        Serial.println(otherNodeFlowRate);
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     pinMode(POWER_LED, OUTPUT);
     pinMode(WIFI_LED, OUTPUT);
     pinMode(LEAK_LED, OUTPUT);
-    digitalWrite(POWER_LED, HIGH);  // Indicate power ON
+    digitalWrite(POWER_LED, HIGH);
     digitalWrite(WIFI_LED, LOW);
     digitalWrite(LEAK_LED, LOW);
 
@@ -68,15 +89,13 @@ void setup() {
     }
     Serial.println("\n✅ WiFi Connected!");
 
-    // MQTT Setup
     espClient.setInsecure();
     mqttClient.setServer(mqtt_server, mqtt_port);
+    mqttClient.setCallback(mqttCallback);
     reconnectMQTT();
 
-    // Start Blynk
     Blynk.begin(auth, ssid, password);
 
-    // Setup Sensors
     pinMode(FLOW_SENSOR, INPUT);
     pinMode(PRESSURE_SENSOR, INPUT);
     pinMode(TAMPER_SENSOR, INPUT_PULLUP);
@@ -89,7 +108,7 @@ void reconnectMQTT() {
         if (mqttClient.connect(nodeID, mqtt_user, mqtt_pass)) {
             Serial.println("✅ MQTT Connected!");
             digitalWrite(WIFI_LED, HIGH);
-            mqttClient.subscribe(mqtt_topic_sub.c_str());
+            mqttClient.subscribe(mqtt_topic_flow_sub.c_str()); // Subscribe to other node's flow rate
         } else {
             Serial.println("❌ Failed, retrying in 5s...");
             digitalWrite(WIFI_LED, LOW);
@@ -99,12 +118,10 @@ void reconnectMQTT() {
 }
 
 void checkWiFiStatus() {
-    if (WiFi.status() == WL_CONNECTED) {
-        digitalWrite(WIFI_LED, HIGH);
-    } else {
+    if (WiFi.status() != WL_CONNECTED) {
         digitalWrite(WIFI_LED, LOW);
         digitalWrite(LEAK_LED, LOW);
-        Serial.println("❌ WiFi Disconnected!");
+        Serial.println("❌ WiFi Disconnected! Reconnecting...");
         WiFi.reconnect();
     }
 }
@@ -124,37 +141,54 @@ void loop() {
 
         int rawPressure = analogRead(PRESSURE_SENSOR);
         float voltage = rawPressure * (3.3 / 4095.0);
-        float pressureMPa = ((voltage - 0.5) / (4.0)) * 1.2;
+        float pressureMPa = ((voltage - 0.5) / 4.0) * 1.2;
         float pressureBar = pressureMPa * 10;
 
-        // Leak detection logic with 10s delay
-        if (flowRate > 3) {
+        // Publish flow data
+        StaticJsonDocument<100> flowDoc;
+        flowDoc["flow"] = flowRate;
+        char flowBuffer[100];
+        serializeJson(flowDoc, flowBuffer);
+        mqttClient.publish(mqtt_topic_flow_pub.c_str(), flowBuffer);
+        Serial.print("📤 Published flow: ");
+        Serial.println(flowBuffer);
+
+        // Leak detection logic (both nodes must have high flow)
+        if (flowRate > 3 && otherNodeFlowRate > 3) {
             if (leakStartTime == 0) {
-                leakStartTime = now;  // Start timer if flow rate > 3
+                leakStartTime = now;
             } else if (now - leakStartTime >= LEAK_DETECTION_TIME) {
                 if (!alarmActive) {
                     alarmActive = true;
                     alarmStartTime = now;
                     digitalWrite(LEAK_LED, HIGH);
-                    mqttClient.publish("esp32/alarm", "🚨 Leak Detected!");
+                    mqttClient.publish("esp32/alarm", "{\"status\": \"Leak Detected!\"}");
                     Serial.println("🚨 Leak Detected!");
                 }
             }
         } else {
-            leakStartTime = 0;  // Reset timer if flow rate drops below 3
+            leakStartTime = 0;  // Reset if one node is below threshold
         }
 
-        // Reset alarm after 1 hour
         if (alarmActive && (now - alarmStartTime >= ALARM_DURATION)) {
             alarmActive = false;
             digitalWrite(LEAK_LED, LOW);
             Serial.println("✅ Leak Alarm Reset");
         }
 
-        char payload[100];
-        sprintf(payload, "Flow: %.2f L/min, Pressure: %.2f bar", flowRate, pressureBar);
-        mqttClient.publish(mqtt_topic_pub.c_str(), payload);
-        Serial.println("📤 Published: " + String(payload));
+        // Publish full sensor data
+        StaticJsonDocument<200> doc;
+        doc["nodeID"] = nodeID;
+        doc["flow"] = flowRate;
+        doc["pressure"] = pressureBar;
+        doc["alarm"] = alarmActive ? "ON" : "OFF";
+
+        char jsonBuffer[256];
+        serializeJson(doc, jsonBuffer);
+        mqttClient.publish(mqtt_topic_pub.c_str(), jsonBuffer);
+
+        Serial.print("📤 Published sensor data: ");
+        Serial.println(jsonBuffer);
 
         lastPublish = now;
     }
